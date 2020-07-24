@@ -43,7 +43,7 @@ func (t *RTPTransceiver) Receiver() *RTPReceiver {
 // setMid sets the RTPTransceiver's mid. If it was already set, will return an error.
 func (t *RTPTransceiver) setMid(mid string) error {
 	if currentMid := t.Mid(); currentMid != "" {
-		return fmt.Errorf("cannot change transceiver mid from: %s to %s", currentMid, mid)
+		return fmt.Errorf("Cannot change transceiver mid from: %s to %s", currentMid, mid)
 	}
 	t.mid.Store(mid)
 	return nil

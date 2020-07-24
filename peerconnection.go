@@ -1199,22 +1199,21 @@ func (pc *PeerConnection) AddTrack(track *Track) (*RTPSender, error) {
 
 	var transceiver *RTPTransceiver
 	for _, t := range pc.GetTransceivers() {
-		if !t.stopped && t.kind == track.Kind() && t.Sender() == nil {
+		if !t.stopped && t.Sender() != nil &&
+			!t.Sender().hasSent() &&
+			t.Receiver() != nil &&
+			t.Receiver().Track() != nil &&
+			t.Receiver().Track().Kind() == track.Kind() {
 			transceiver = t
 			break
 		}
 	}
 	if transceiver != nil {
-		sender, err := pc.api.NewRTPSender(track, pc.dtlsTransport)
-		if err != nil {
-			return nil, err
-		}
-		transceiver.setSender(sender)
 		// we still need to call setSendingTrack to ensure direction has changed
 		if err := transceiver.setSendingTrack(track); err != nil {
 			return nil, err
 		}
-		return sender, nil
+		return transceiver.Sender(), nil
 	}
 
 	transceiver, err := pc.AddTransceiverFromTrack(track)
