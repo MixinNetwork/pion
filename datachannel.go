@@ -12,7 +12,7 @@ import (
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"
-	"github.com/pion/webrtc/v2/pkg/rtcerr"
+	"github.com/pion/webrtc/v3/pkg/rtcerr"
 )
 
 const dataChannelBufferSize = math.MaxUint16 //message size limit for Chromium
@@ -278,10 +278,10 @@ func (d *DataChannel) onMessage(msg DataChannelMessage) {
 }
 
 func (d *DataChannel) handleOpen(dc *datachannel.DataChannel) {
-	d.setReadyState(DataChannelStateOpen)
 	d.mu.Lock()
 	d.dataChannel = dc
 	d.mu.Unlock()
+	d.setReadyState(DataChannelStateOpen)
 
 	d.onOpen()
 
@@ -335,10 +335,6 @@ func (d *DataChannel) Send(data []byte) error {
 		return err
 	}
 
-	if len(data) == 0 {
-		data = []byte{0}
-	}
-
 	_, err = d.dataChannel.WriteDataChannel(data, false)
 	return err
 }
@@ -350,12 +346,7 @@ func (d *DataChannel) SendText(s string) error {
 		return err
 	}
 
-	data := []byte(s)
-	if len(data) == 0 {
-		data = []byte{0}
-	}
-
-	_, err = d.dataChannel.WriteDataChannel(data, true)
+	_, err = d.dataChannel.WriteDataChannel([]byte(s), true)
 	return err
 }
 
