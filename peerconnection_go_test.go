@@ -412,6 +412,32 @@ func TestPeerConnection_AnswerWithoutOffer(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
+func TestPeerConnection_AnswerWithClosedConnection(t *testing.T) {
+	report := test.CheckRoutines(t)
+	defer report()
+
+	offerPeerConn, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	answerPeerConn, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	_, err = offerPeerConn.CreateDataChannel("test-channel", nil)
+	assert.NoError(t, err)
+
+	offer, err := offerPeerConn.CreateOffer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, offerPeerConn.SetLocalDescription(offer))
+
+	assert.NoError(t, answerPeerConn.SetRemoteDescription(offer))
+
+	assert.NoError(t, offerPeerConn.Close())
+	assert.NoError(t, answerPeerConn.Close())
+
+	_, err = answerPeerConn.CreateAnswer(nil)
+	assert.Error(t, err, &rtcerr.InvalidStateError{Err: ErrConnectionClosed})
+}
+
 func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 	createTransceiver := func(kind RTPCodecType, direction RTPTransceiverDirection) *RTPTransceiver {
 		r := &RTPTransceiver{kind: kind}
@@ -525,8 +551,7 @@ func TestOneAttrKeyConnectionSetupPerMediaDescriptionInSDP(t *testing.T) {
 
 	matches := re.FindAllStringIndex(sdp.SDP, -1)
 
-	// 5 because a datachannel is always added
-	assert.Len(t, matches, 5)
+	assert.Len(t, matches, 4)
 	assert.NoError(t, pc.Close())
 }
 
@@ -673,6 +698,9 @@ func TestPeerConnectionTrickle(t *testing.T) {
 	offerPC, answerPC, err := newPair()
 	assert.NoError(t, err)
 
+	_, err = offerPC.CreateDataChannel("test-channel", nil)
+	assert.NoError(t, err)
+
 	addOrCacheCandidate := func(pc *PeerConnection, c *ICECandidate, candidateCache []ICECandidateInit) []ICECandidateInit {
 		if c == nil {
 			return candidateCache
@@ -779,6 +807,9 @@ func TestPopulateLocalCandidates(t *testing.T) {
 
 	t.Run("end-of-candidates only when gathering is complete", func(t *testing.T) {
 		pc, err := NewAPI().NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+
+		_, err = pc.CreateDataChannel("test-channel", nil)
 		assert.NoError(t, err)
 
 		offer, err := pc.CreateOffer(nil)

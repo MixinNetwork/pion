@@ -278,35 +278,31 @@ func TestSetRemoteDescription(t *testing.T) {
 
 func TestCreateOfferAnswer(t *testing.T) {
 	offerPeerConn, err := NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Errorf("New PeerConnection: got error: %v", err)
-	}
-	offer, err := offerPeerConn.CreateOffer(nil)
-	if err != nil {
-		t.Errorf("Create Offer: got error: %v", err)
-	}
-	if err = offerPeerConn.SetLocalDescription(offer); err != nil {
-		t.Errorf("SetLocalDescription: got error: %v", err)
-	}
+	assert.NoError(t, err)
+
 	answerPeerConn, err := NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Errorf("New PeerConnection: got error: %v", err)
-	}
-	err = answerPeerConn.SetRemoteDescription(offer)
-	if err != nil {
-		t.Errorf("SetRemoteDescription: got error: %v", err)
-	}
+	assert.NoError(t, err)
+
+	_, err = offerPeerConn.CreateDataChannel("test-channel", nil)
+	assert.NoError(t, err)
+
+	offer, err := offerPeerConn.CreateOffer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, offerPeerConn.SetLocalDescription(offer))
+
+	assert.NoError(t, answerPeerConn.SetRemoteDescription(offer))
+
 	answer, err := answerPeerConn.CreateAnswer(nil)
-	if err != nil {
-		t.Errorf("Create Answer: got error: %v", err)
-	}
-	if err = answerPeerConn.SetLocalDescription(answer); err != nil {
-		t.Errorf("SetLocalDescription: got error: %v", err)
-	}
-	err = offerPeerConn.SetRemoteDescription(answer)
-	if err != nil {
-		t.Errorf("SetRemoteDescription (Originator): got error: %v", err)
-	}
+	assert.NoError(t, err)
+
+	assert.NoError(t, answerPeerConn.SetLocalDescription(answer))
+	assert.NoError(t, offerPeerConn.SetRemoteDescription(answer))
+
+	// after setLocalDescription(answer), signaling state should be stable.
+	// so CreateAnswer should return an InvalidStateError
+	assert.Equal(t, answerPeerConn.SignalingState(), SignalingStateStable)
+	_, err = answerPeerConn.CreateAnswer(nil)
+	assert.Error(t, err, &rtcerr.InvalidStateError{Err: ErrIncorrectSignalingState})
 
 	assert.NoError(t, offerPeerConn.Close())
 	assert.NoError(t, answerPeerConn.Close())
@@ -485,6 +481,88 @@ a=end-of-candidates
 	}
 
 	assert.NoError(t, pc.Close())
+}
+
+func TestNegotiationNeeded(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	pc, err := NewPeerConnection(Configuration{})
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	pc.OnNegotiationNeeded(wg.Done)
+	_, err = pc.CreateDataChannel("initial_data_channel", nil)
+	assert.NoError(t, err)
+
+	wg.Wait()
+
+	assert.NoError(t, pc.Close())
+}
+
+func TestMultipleCreateChannel(t *testing.T) {
+	var wg sync.WaitGroup
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	// Two OnDataChannel
+	// One OnNegotiationNeeded
+	wg.Add(3)
+
+	pcOffer, _ := NewPeerConnection(Configuration{})
+	pcAnswer, _ := NewPeerConnection(Configuration{})
+
+	pcAnswer.OnDataChannel(func(d *DataChannel) {
+		wg.Done()
+	})
+
+	pcOffer.OnNegotiationNeeded(func() {
+		offer, err := pcOffer.CreateOffer(nil)
+		assert.NoError(t, err)
+
+		offerGatheringComplete := GatheringCompletePromise(pcOffer)
+		if err = pcOffer.SetLocalDescription(offer); err != nil {
+			t.Error(err)
+		}
+		<-offerGatheringComplete
+		if err = pcAnswer.SetRemoteDescription(*pcOffer.LocalDescription()); err != nil {
+			t.Error(err)
+		}
+
+		answer, err := pcAnswer.CreateAnswer(nil)
+		assert.NoError(t, err)
+
+		answerGatheringComplete := GatheringCompletePromise(pcAnswer)
+		if err = pcAnswer.SetLocalDescription(answer); err != nil {
+			t.Error(err)
+		}
+		<-answerGatheringComplete
+		if err = pcOffer.SetRemoteDescription(*pcAnswer.LocalDescription()); err != nil {
+			t.Error(err)
+		}
+		wg.Done()
+	})
+
+	if _, err := pcOffer.CreateDataChannel("initial_data_channel_0", nil); err != nil {
+		t.Error(err)
+	}
+
+	if _, err := pcOffer.CreateDataChannel("initial_data_channel_1", nil); err != nil {
+		t.Error(err)
+	}
+
+	wg.Wait()
+
+	assert.NoError(t, pcOffer.Close())
+	assert.NoError(t, pcAnswer.Close())
 }
 
 // Assert that candidates are gathered by calling SetLocalDescription, not SetRemoteDescription
