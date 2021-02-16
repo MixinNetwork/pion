@@ -5,21 +5,28 @@ package webrtc
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"math/rand"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pion/randutil"
 	"github.com/pion/rtcp"
-	"github.com/pion/sdp/v2"
+	"github.com/pion/rtp"
 	"github.com/pion/transport/test"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+)
+
+var (
+	errIncomingTrackIDInvalid    = errors.New("incoming Track ID is invalid")
+	errIncomingTrackLabelInvalid = errors.New("incoming Track Label is invalid")
+	errNoTransceiverwithMid      = errors.New("no transceiver with mid")
 )
 
 func offerMediaHasDirection(offer SessionDescription, kind RTPCodecType, direction RTPTransceiverDirection) bool {
@@ -41,19 +48,17 @@ each side gets something (and asserts payload contents)
 // nolint: gocyclo
 func TestPeerConnection_Media_Sample(t *testing.T) {
 	const (
-		expectedTrackID    = "video"
-		expectedTrackLabel = "pion"
+		expectedTrackID  = "video"
+		expectedStreamID = "pion"
 	)
 
-	api := NewAPI()
 	lim := test.TimeOut(time.Second * 30)
 	defer lim.Stop()
 
 	report := test.CheckRoutines(t)
 	defer report()
 
-	api.mediaEngine.RegisterDefaultCodecs()
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
+	pcOffer, pcAnswer, err := newPair()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,14 +75,14 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 
 	trackMetadataValid := make(chan error)
 
-	pcAnswer.OnTrack(func(track *Track, receiver *RTPReceiver) {
+	pcAnswer.OnTrack(func(track *TrackRemote, receiver *RTPReceiver) {
 		if track.ID() != expectedTrackID {
-			trackMetadataValid <- fmt.Errorf("Incoming Track ID is invalid expected(%s) actual(%s)", expectedTrackID, track.ID())
+			trackMetadataValid <- fmt.Errorf("%w: expected(%s) actual(%s)", errIncomingTrackIDInvalid, expectedTrackID, track.ID())
 			return
 		}
 
-		if track.Label() != expectedTrackLabel {
-			trackMetadataValid <- fmt.Errorf("Incoming Track Label is invalid expected(%s) actual(%s)", expectedTrackLabel, track.Label())
+		if track.StreamID() != expectedStreamID {
+			trackMetadataValid <- fmt.Errorf("%w: expected(%s) actual(%s)", errIncomingTrackLabelInvalid, expectedStreamID, track.StreamID())
 			return
 		}
 		close(trackMetadataValid)
@@ -85,7 +90,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 		go func() {
 			for {
 				time.Sleep(time.Millisecond * 100)
-				if routineErr := pcAnswer.WriteRTCP([]rtcp.Packet{&rtcp.RapidResynchronizationRequest{SenderSSRC: track.SSRC(), MediaSSRC: track.SSRC()}}); routineErr != nil {
+				if routineErr := pcAnswer.WriteRTCP([]rtcp.Packet{&rtcp.RapidResynchronizationRequest{SenderSSRC: uint32(track.SSRC()), MediaSSRC: uint32(track.SSRC())}}); routineErr != nil {
 					awaitRTCPReceiverSend <- routineErr
 					return
 				}
@@ -100,7 +105,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 		}()
 
 		go func() {
-			_, routineErr := receiver.Read(make([]byte, 1400))
+			_, _, routineErr := receiver.Read(make([]byte, 1400))
 			if routineErr != nil {
 				awaitRTCPReceiverRecv <- routineErr
 			} else {
@@ -110,7 +115,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 
 		haveClosedAwaitRTPRecv := false
 		for {
-			p, routineErr := track.ReadRTP()
+			p, _, routineErr := track.ReadRTP()
 			if routineErr != nil {
 				close(awaitRTPRecvClosed)
 				return
@@ -121,11 +126,11 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 		}
 	})
 
-	vp8Track, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), expectedTrackID, expectedTrackLabel)
+	vp8Track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, expectedTrackID, expectedStreamID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rtpSender, err := pcOffer.AddTrack(vp8Track)
+	sender, err := pcOffer.AddTrack(vp8Track)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +138,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 100)
-			if routineErr := vp8Track.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}); routineErr != nil {
+			if routineErr := vp8Track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second}); routineErr != nil {
 				fmt.Println(routineErr)
 			}
 
@@ -149,7 +154,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 100)
-			if routineErr := pcOffer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: vp8Track.SSRC(), MediaSSRC: vp8Track.SSRC()}}); routineErr != nil {
+			if routineErr := pcOffer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: uint32(sender.ssrc), MediaSSRC: uint32(sender.ssrc)}}); routineErr != nil {
 				awaitRTCPSenderSend <- routineErr
 			}
 
@@ -163,15 +168,12 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	}()
 
 	go func() {
-		if _, routineErr := rtpSender.Read(make([]byte, 1400)); routineErr == nil {
+		if _, _, routineErr := sender.Read(make([]byte, 1400)); routineErr == nil {
 			close(awaitRTCPSenderRecv)
 		}
 	}()
 
-	err = signalPair(pcOffer, pcAnswer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
 	err, ok := <-trackMetadataValid
 	if ok {
@@ -182,14 +184,12 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	<-awaitRTPSend
 
 	<-awaitRTCPSenderRecv
-	err, ok = <-awaitRTCPSenderSend
-	if ok {
+	if err, ok = <-awaitRTCPSenderSend; ok {
 		t.Fatal(err)
 	}
 
 	<-awaitRTCPReceiverRecv
-	err, ok = <-awaitRTCPReceiverSend
-	if ok {
+	if err, ok = <-awaitRTCPReceiverSend; ok {
 		t.Fatal(err)
 	}
 
@@ -216,9 +216,7 @@ func TestPeerConnection_Media_Shutdown(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	api := NewAPI()
-	api.mediaEngine.RegisterDefaultCodecs()
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
+	pcOffer, pcAnswer, err := newPair()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,11 +231,12 @@ func TestPeerConnection_Media_Shutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opusTrack, err := pcOffer.NewTrack(DefaultPayloadTypeOpus, rand.Uint32(), "audio", "pion1")
+	opusTrack, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "audio/opus"}, "audio", "pion1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	vp8Track, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+
+	vp8Track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +250,7 @@ func TestPeerConnection_Media_Shutdown(t *testing.T) {
 	var onTrackFiredLock sync.Mutex
 	onTrackFired := false
 
-	pcAnswer.OnTrack(func(track *Track, receiver *RTPReceiver) {
+	pcAnswer.OnTrack(func(track *TrackRemote, receiver *RTPReceiver) {
 		onTrackFiredLock.Lock()
 		defer onTrackFiredLock.Unlock()
 		onTrackFired = true
@@ -318,15 +317,12 @@ func TestPeerConnection_Media_Disconnected(t *testing.T) {
 	s := SettingEngine{}
 	s.SetICETimeouts(1*time.Second, 5*time.Second, 250*time.Millisecond)
 
-	api := NewAPI(WithSettingEngine(s))
-	api.mediaEngine.RegisterDefaultCodecs()
-
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
+	pcOffer, pcAnswer, err := newPair()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	vp8Track, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+	vp8Track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +368,7 @@ func TestPeerConnection_Media_Disconnected(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i <= 5; i++ {
-		if rtpErr := vp8Track.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}); rtpErr != nil {
+		if rtpErr := vp8Track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second}); rtpErr != nil {
 			t.Fatal(rtpErr)
 		} else if rtcpErr := pcOffer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 0}}); rtcpErr != nil {
 			t.Fatal(rtcpErr)
@@ -380,86 +376,6 @@ func TestPeerConnection_Media_Disconnected(t *testing.T) {
 	}
 
 	assert.NoError(t, pcOffer.Close())
-}
-
-/*
-Integration test for behavior around media and closing
-
-* Writing and Reading from tracks should return io.EOF when the PeerConnection is closed
-*/
-func TestPeerConnection_Media_Closed(t *testing.T) {
-	lim := test.TimeOut(time.Second * 30)
-	defer lim.Stop()
-
-	report := test.CheckRoutines(t)
-	defer report()
-
-	api := NewAPI()
-	api.mediaEngine.RegisterDefaultCodecs()
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	vp8Writer, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err = pcOffer.AddTrack(vp8Writer); err != nil {
-		t.Fatal(err)
-	}
-
-	answerChan := make(chan *Track)
-	pcAnswer.OnTrack(func(t *Track, r *RTPReceiver) {
-		answerChan <- t
-	})
-
-	err = signalPair(pcOffer, pcAnswer)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	vp8Reader := func() *Track {
-		for {
-			if err = vp8Writer.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}); err != nil {
-				t.Fatal(err)
-			}
-			time.Sleep(time.Millisecond * 25)
-
-			select {
-			case t := <-answerChan:
-				return t
-			default:
-				continue
-			}
-		}
-	}()
-
-	closeChan := make(chan error)
-	go func() {
-		time.Sleep(time.Second)
-		closeChan <- pcAnswer.Close()
-	}()
-	if _, err = vp8Reader.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatal("Reading from closed Track did not return io.EOF")
-	} else if err = <-closeChan; err != nil {
-		t.Fatal(err)
-	}
-
-	assert.NoError(t, pcOffer.Close())
-	assert.NoError(t, pcAnswer.Close())
-
-	if err = vp8Writer.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}); err != io.ErrClosedPipe {
-		t.Fatal("Write to Track with no RTPSenders did not return io.ErrClosedPipe")
-	} else if err = pcAnswer.WriteRTCP([]rtcp.Packet{&rtcp.RapidResynchronizationRequest{SenderSSRC: 0, MediaSSRC: 0}}); err != io.ErrClosedPipe {
-		t.Fatal("WriteRTCP to closed PeerConnection did not return io.ErrClosedPipe")
-	}
 }
 
 // If a SessionDescription has a single media section and no SSRC
@@ -471,25 +387,23 @@ func TestUndeclaredSSRC(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	api := NewAPI()
-	api.mediaEngine.RegisterDefaultCodecs()
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
-	assert.NoError(t, err)
-
-	_, err = pcOffer.CreateDataChannel("test-channel", nil)
+	pcOffer, pcAnswer, err := newPair()
 	assert.NoError(t, err)
 
 	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
 	assert.NoError(t, err)
 
-	vp8Writer, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+	_, err = pcOffer.CreateDataChannel("test-channel", nil)
+	assert.NoError(t, err)
+
+	vp8Writer, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
 	assert.NoError(t, err)
 
 	_, err = pcOffer.AddTrack(vp8Writer)
 	assert.NoError(t, err)
 
-	onTrackFired := make(chan *Track)
-	pcAnswer.OnTrack(func(t *Track, r *RTPReceiver) {
+	onTrackFired := make(chan *TrackRemote)
+	pcAnswer.OnTrack(func(t *TrackRemote, r *RTPReceiver) {
 		close(onTrackFired)
 	})
 
@@ -508,7 +422,7 @@ func TestUndeclaredSSRC(t *testing.T) {
 	inApplicationMedia := false
 	for scanner.Scan() {
 		l := scanner.Text()
-		if strings.HasPrefix(l, "m=") {
+		if strings.HasPrefix(l, "m=application") {
 			inApplicationMedia = !inApplicationMedia
 		} else if strings.HasPrefix(l, "a=ssrc") {
 			continue
@@ -536,7 +450,7 @@ func TestUndeclaredSSRC(t *testing.T) {
 
 	go func() {
 		for {
-			assert.NoError(t, vp8Writer.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}))
+			assert.NoError(t, vp8Writer.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second}))
 			time.Sleep(time.Millisecond * 25)
 
 			select {
@@ -553,57 +467,6 @@ func TestUndeclaredSSRC(t *testing.T) {
 	assert.NoError(t, pcAnswer.Close())
 }
 
-func TestOfferRejectionMissingCodec(t *testing.T) {
-	lim := test.TimeOut(time.Second * 30)
-	defer lim.Stop()
-
-	report := test.CheckRoutines(t)
-	defer report()
-
-	api := NewAPI()
-	api.mediaEngine.RegisterDefaultCodecs()
-	pc, err := api.NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	noCodecAPI := NewAPI()
-	noCodecPC, err := noCodecAPI.NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	track, err := pc.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pc.AddTrack(track); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := signalPair(pc, noCodecPC); err != nil {
-		t.Fatal(err)
-	}
-
-	var sdes sdp.SessionDescription
-	if err := sdes.Unmarshal([]byte(pc.RemoteDescription().SDP)); err != nil {
-		t.Fatal(err)
-	}
-	var videoDesc sdp.MediaDescription
-	for _, m := range sdes.MediaDescriptions {
-		if m.MediaName.Media == "video" {
-			videoDesc = *m
-		}
-	}
-
-	if got, want := videoDesc.MediaName.Formats, []string{"0"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("rejecting unknown codec: sdp m=%s, want trailing 0", *videoDesc.MediaName.String())
-	}
-
-	assert.NoError(t, noCodecPC.Close())
-	assert.NoError(t, pc.Close())
-}
-
 func TestAddTransceiverFromTrackSendOnly(t *testing.T) {
 	lim := test.TimeOut(time.Second * 30)
 	defer lim.Stop()
@@ -616,13 +479,11 @@ func TestAddTransceiverFromTrackSendOnly(t *testing.T) {
 		t.Error(err.Error())
 	}
 
-	track, err := pc.NewTrack(
-		DefaultPayloadTypeOpus,
-		0xDEADBEEF,
+	track, err := NewTrackLocalStaticSample(
+		RTPCodecCapability{MimeType: "audio/Opus"},
 		"track-id",
-		"track-label",
+		"stream-id",
 	)
-
 	if err != nil {
 		t.Error(err.Error())
 	}
@@ -674,13 +535,11 @@ func TestAddTransceiverFromTrackSendRecv(t *testing.T) {
 		t.Error(err.Error())
 	}
 
-	track, err := pc.NewTrack(
-		DefaultPayloadTypeOpus,
-		0xDEADBEEF,
+	track, err := NewTrackLocalStaticSample(
+		RTPCodecCapability{MimeType: "audio/Opus"},
 		"track-id",
-		"track-label",
+		"stream-id",
 	)
-
 	if err != nil {
 		t.Error(err.Error())
 	}
@@ -728,7 +587,7 @@ func TestAddTransceiver(t *testing.T) {
 		t.Error(err.Error())
 	}
 
-	transceiver, err := pc.AddTransceiver(RTPCodecTypeVideo, RtpTransceiverInit{
+	transceiver, err := pc.AddTransceiverFromKind(RTPCodecTypeVideo, RtpTransceiverInit{
 		Direction: RTPTransceiverDirectionSendrecv,
 	})
 	if err != nil {
@@ -755,10 +614,7 @@ func TestAddTransceiver(t *testing.T) {
 }
 
 func TestAddTransceiverAddTrack_Reuse(t *testing.T) {
-	mediaEngine := MediaEngine{}
-	mediaEngine.RegisterDefaultCodecs()
-	api := NewAPI(WithMediaEngine(mediaEngine))
-	pc, err := api.NewPeerConnection(Configuration{})
+	pc, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
 	tr, err := pc.AddTransceiverFromKind(
@@ -769,8 +625,8 @@ func TestAddTransceiverAddTrack_Reuse(t *testing.T) {
 
 	assert.Equal(t, []*RTPTransceiver{tr}, pc.GetTransceivers())
 
-	addTrack := func() (*Track, *RTPSender) {
-		track, err := pc.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "foo", "bar")
+	addTrack := func() (TrackLocal, *RTPSender) {
+		track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "foo", "bar")
 		assert.NoError(t, err)
 
 		sender, err := pc.AddTrack(track)
@@ -796,10 +652,7 @@ func TestAddTransceiverAddTrack_Reuse(t *testing.T) {
 }
 
 func TestAddTransceiverAddTrack_NewRTPSender_Error(t *testing.T) {
-	mediaEngine := MediaEngine{}
-	mediaEngine.RegisterDefaultCodecs()
-	api := NewAPI(WithMediaEngine(mediaEngine))
-	pc, err := api.NewPeerConnection(Configuration{})
+	pc, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
 	_, err = pc.AddTransceiverFromKind(
@@ -811,7 +664,7 @@ func TestAddTransceiverAddTrack_NewRTPSender_Error(t *testing.T) {
 	dtlsTransport := pc.dtlsTransport
 	pc.dtlsTransport = nil
 
-	track, err := pc.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "foo", "bar")
+	track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "foo", "bar")
 	assert.NoError(t, err)
 
 	_, err = pc.AddTrack(track)
@@ -824,10 +677,7 @@ func TestAddTransceiverAddTrack_NewRTPSender_Error(t *testing.T) {
 }
 
 func TestRtpSenderReceiver_ReadClose_Error(t *testing.T) {
-	mediaEngine := MediaEngine{}
-	mediaEngine.RegisterDefaultCodecs()
-	api := NewAPI(WithMediaEngine(mediaEngine))
-	pc, err := api.NewPeerConnection(Configuration{})
+	pc, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
 	tr, err := pc.AddTransceiverFromKind(
@@ -838,11 +688,11 @@ func TestRtpSenderReceiver_ReadClose_Error(t *testing.T) {
 
 	sender, receiver := tr.Sender(), tr.Receiver()
 	assert.NoError(t, sender.Stop())
-	_, err = sender.Read(make([]byte, 0, 1400))
+	_, _, err = sender.Read(make([]byte, 0, 1400))
 	assert.Error(t, err, io.ErrClosedPipe)
 
 	assert.NoError(t, receiver.Stop())
-	_, err = receiver.Read(make([]byte, 0, 1400))
+	_, _, err = receiver.Read(make([]byte, 0, 1400))
 	assert.Error(t, err, io.ErrClosedPipe)
 
 	assert.NoError(t, pc.Close())
@@ -923,13 +773,11 @@ func TestAddTransceiverFromTrackFailsRecvOnly(t *testing.T) {
 		t.Error(err.Error())
 	}
 
-	track, err := pc.NewTrack(
-		DefaultPayloadTypeH264,
-		0xDEADBEEF,
+	track, err := NewTrackLocalStaticSample(
+		RTPCodecCapability{MimeType: "video/h264", SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"},
 		"track-id",
 		"track-label",
 	)
-
 	if err != nil {
 		t.Error(err.Error())
 	}
@@ -946,112 +794,10 @@ func TestAddTransceiverFromTrackFailsRecvOnly(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
-func TestOmitMediaFromBundleIfUnsupported(t *testing.T) {
-	const sdpOfferWithAudioAndVideo = `v=0
-o=- 6476616870435111971 2 IN IP4 127.0.0.1
-s=-
-t=0 0
-a=group:BUNDLE 0 1
-m=audio 9 UDP/TLS/RTP/SAVPF 111
-c=IN IP4 0.0.0.0
-a=rtcp:9 IN IP4 0.0.0.0
-a=ice-ufrag:sRIG
-a=ice-pwd:yZb5ZMsBlPoK577sGhjvEUtT
-a=ice-options:trickle
-a=fingerprint:sha-256 27:EF:25:BF:57:45:BC:1C:0D:36:42:FF:5E:93:71:D2:41:58:EA:46:FD:A8:2A:F3:13:94:6E:E6:43:23:CB:D7
-a=setup:actpass
-a=mid:0
-a=sendrecv
-a=rtpmap:111 opus/48000/2
-a=fmtp:111 minptime=10;useinbandfec=1
-m=video 9 UDP/TLS/RTP/SAVPF 96
-c=IN IP4 0.0.0.0
-a=rtcp:9 IN IP4 0.0.0.0
-a=ice-ufrag:sRIG
-a=ice-pwd:yZb5ZMsBlPoK577sGhjvEUtT
-a=ice-options:trickle
-a=fingerprint:sha-256 27:EF:25:BF:57:45:BC:1C:0D:36:42:FF:5E:93:71:D2:41:58:EA:46:FD:A8:2A:F3:13:94:6E:E6:43:23:CB:D7
-a=setup:actpass
-a=mid:1
-a=sendrecv
-a=rtpmap:96 H264/90000
-a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f
-`
-	lim := test.TimeOut(time.Second * 30)
-	defer lim.Stop()
-
-	report := test.CheckRoutines(t)
-	defer report()
-
-	mediaEngine := MediaEngine{}
-	mediaEngine.RegisterCodec(
-		NewRTPH264Codec(DefaultPayloadTypeH264, 90000),
-	)
-
-	api := NewAPI(
-		WithMediaEngine(mediaEngine),
-	)
-
-	pc, err := api.NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Error(err.Error())
-	}
-
-	if err = pc.SetRemoteDescription(SessionDescription{
-		Type: SDPTypeOffer,
-		SDP:  sdpOfferWithAudioAndVideo,
-	}); nil != err {
-		t.Error(err.Error())
-	}
-
-	answer, err := pc.CreateAnswer(nil)
-	if nil != err {
-		t.Error(err.Error())
-	}
-
-	success := false
-	for _, attr := range answer.parsed.Attributes {
-		if attr.Key == "group" {
-			if attr.Value == "BUNDLE 1" {
-				success = true
-			}
-		}
-	}
-
-	if !success {
-		t.Fail()
-	}
-	assert.NoError(t, pc.Close())
-}
-
-func TestGetRegisteredRTPCodecs(t *testing.T) {
-	mediaEngine := MediaEngine{}
-	expectedCodec := NewRTPH264Codec(DefaultPayloadTypeH264, 90000)
-	mediaEngine.RegisterCodec(expectedCodec)
-
-	api := NewAPI(WithMediaEngine(mediaEngine))
-	pc, err := api.NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Error(err.Error())
-	}
-
-	codecs := pc.GetRegisteredRTPCodecs(RTPCodecTypeVideo)
-	if len(codecs) != 1 {
-		t.Errorf("expected to get only 1 codec but got %d codecs", len(codecs))
-	}
-
-	actualCodec := codecs[0]
-	if actualCodec != expectedCodec {
-		t.Errorf("expected to get %v but got %v", expectedCodec, actualCodec)
-	}
-
-	assert.NoError(t, pc.Close())
-}
-
 func TestPlanBMediaExchange(t *testing.T) {
 	runTest := func(trackCount int, t *testing.T) {
-		addSingleTrack := func(p *PeerConnection) *Track {
-			track, err := p.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), fmt.Sprintf("video-%d", rand.Uint32()), fmt.Sprintf("video-%d", rand.Uint32()))
+		addSingleTrack := func(p *PeerConnection) *TrackLocalStaticSample {
+			track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, fmt.Sprintf("video-%d", randutil.NewMathRandomGenerator().Uint32()), fmt.Sprintf("video-%d", randutil.NewMathRandomGenerator().Uint32()))
 			assert.NoError(t, err)
 
 			_, err = p.AddTrack(track)
@@ -1068,7 +814,7 @@ func TestPlanBMediaExchange(t *testing.T) {
 
 		var onTrackWaitGroup sync.WaitGroup
 		onTrackWaitGroup.Add(trackCount)
-		pcAnswer.OnTrack(func(track *Track, r *RTPReceiver) {
+		pcAnswer.OnTrack(func(track *TrackRemote, r *RTPReceiver) {
 			onTrackWaitGroup.Done()
 		})
 
@@ -1081,7 +827,7 @@ func TestPlanBMediaExchange(t *testing.T) {
 		_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
 		assert.NoError(t, err)
 
-		outboundTracks := []*Track{}
+		outboundTracks := []*TrackLocalStaticSample{}
 		for i := 0; i < trackCount; i++ {
 			outboundTracks = append(outboundTracks, addSingleTrack(pcOffer))
 		}
@@ -1093,7 +839,7 @@ func TestPlanBMediaExchange(t *testing.T) {
 				select {
 				case <-time.After(20 * time.Millisecond):
 					for _, track := range outboundTracks {
-						assert.NoError(t, track.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}))
+						assert.NoError(t, track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second}))
 					}
 				case <-done:
 					return
@@ -1137,7 +883,7 @@ func TestPeerConnection_Start_Only_Negotiated_Senders(t *testing.T) {
 	assert.NoError(t, err)
 	defer func() { assert.NoError(t, pcAnswer.Close()) }()
 
-	track1, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion1")
+	track1, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion1")
 	require.NoError(t, err)
 
 	sender1, err := pcOffer.AddTrack(track1)
@@ -1158,7 +904,7 @@ func TestPeerConnection_Start_Only_Negotiated_Senders(t *testing.T) {
 
 	// Add a new track between providing the offer and applying the answer
 
-	track2, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+	track2, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion2")
 	require.NoError(t, err)
 
 	sender2, err := pcOffer.AddTrack(track2)
@@ -1186,24 +932,22 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 			}
 			return transceiver.Receiver() != nil && transceiver.Receiver().haveReceived(), nil
 		}
-		return false, fmt.Errorf("no transceiver with mid %q", mid)
+		return false, fmt.Errorf("%w: %q", errNoTransceiverwithMid, mid)
 	}
 
-	api := NewAPI()
 	lim := test.TimeOut(time.Second * 30)
 	defer lim.Stop()
 
 	report := test.CheckRoutines(t)
 	defer report()
 
-	api.mediaEngine.RegisterDefaultCodecs()
-	pcOffer, pcAnswer, err := api.newPair(Configuration{})
+	pcOffer, pcAnswer, err := newPair()
 	require.NoError(t, err)
 
 	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo, RtpTransceiverInit{Direction: RTPTransceiverDirectionRecvonly})
 	assert.NoError(t, err)
 
-	track1, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion1")
+	track1, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion1")
 	require.NoError(t, err)
 
 	sender1, err := pcOffer.AddTrack(track1)
@@ -1255,4 +999,91 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 
 	assert.NoError(t, pcOffer.Close())
 	assert.NoError(t, pcAnswer.Close())
+}
+
+// Assert that failed Simulcast probing doesn't cause
+// the handleUndeclaredSSRC to be leaked
+func TestPeerConnection_Simulcast_Probe(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion")
+	assert.NoError(t, err)
+
+	offerer, answerer, err := newPair()
+	assert.NoError(t, err)
+
+	_, err = offerer.AddTrack(track)
+	assert.NoError(t, err)
+
+	ticker := time.NewTicker(time.Millisecond * 20)
+	testFinished := make(chan struct{})
+	seenFiveStreams, seenFiveStreamsCancel := context.WithCancel(context.Background())
+
+	go func() {
+		for {
+			select {
+			case <-testFinished:
+				return
+			case <-ticker.C:
+				answerer.dtlsTransport.lock.Lock()
+				if len(answerer.dtlsTransport.simulcastStreams) >= 5 {
+					seenFiveStreamsCancel()
+				}
+				answerer.dtlsTransport.lock.Unlock()
+
+				track.mu.Lock()
+				if len(track.bindings) == 1 {
+					_, err = track.bindings[0].writeStream.WriteRTP(&rtp.Header{
+						Version: 2,
+						SSRC:    randutil.NewMathRandomGenerator().Uint32(),
+					}, []byte{0, 1, 2, 3, 4, 5})
+					assert.NoError(t, err)
+				}
+				track.mu.Unlock()
+			}
+		}
+	}()
+
+	assert.NoError(t, signalPair(offerer, answerer))
+
+	peerConnectionConnected := untilConnectionState(PeerConnectionStateConnected, offerer, answerer)
+	peerConnectionConnected.Wait()
+
+	<-seenFiveStreams.Done()
+
+	assert.NoError(t, answerer.Close())
+	assert.NoError(t, offerer.Close())
+	close(testFinished)
+}
+
+// Assert that CreateOffer can't enter infinite loop
+// We attempt to generate an offer multiple times in case a user
+// has edited the PeerConnection. We can assert this broken behavior with an
+// empty MediaEngine. See pion/webrtc#1656 for full behavior
+func TestPeerConnection_CreateOffer_InfiniteLoop(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	m := &MediaEngine{}
+
+	pc, err := NewAPI(WithMediaEngine(m)).NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion")
+	assert.NoError(t, err)
+
+	_, err = pc.AddTrack(track)
+	assert.NoError(t, err)
+
+	_, err = pc.CreateOffer(nil)
+	assert.Error(t, err, errExcessiveRetries)
+
+	assert.NoError(t, pc.Close())
 }

@@ -1,10 +1,11 @@
+// +build !js
+
 package main
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"time"
 
@@ -17,34 +18,7 @@ import (
 const cipherKey = 0xAA
 
 func main() {
-	// Wait for the offer to be pasted
-	offer := webrtc.SessionDescription{}
-	signal.Decode(signal.MustReadStdin(), &offer)
-
-	// We make our own mediaEngine so we can place the sender's codecs in it.  This because we must use the
-	// dynamic media type from the sender in our answer. This is not required if we are the offerer
-	mediaEngine := webrtc.MediaEngine{}
-	err := mediaEngine.PopulateFromSDP(offer)
-	if err != nil {
-		panic(err)
-	}
-
-	// Search for VP8 Payload type. If the offer doesn't support VP8 exit since
-	// since they won't be able to decode anything we send them
-	var payloadType uint8
-	for _, videoCodec := range mediaEngine.GetCodecsByKind(webrtc.RTPCodecTypeVideo) {
-		if videoCodec.Name == "VP8" {
-			payloadType = videoCodec.PayloadType
-			break
-		}
-	}
-	if payloadType == 0 {
-		panic("Remote peer does not support VP8")
-	}
-
-	// Create a new RTCPeerConnection
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
-	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{
+	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
 				URLs: []string{"stun:stun.l.google.com:19302"},
@@ -56,13 +30,26 @@ func main() {
 	}
 
 	// Create a video track
-	videoTrack, err := peerConnection.NewTrack(payloadType, rand.Uint32(), "video", "pion")
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: "video/vp8"}, "video", "pion")
 	if err != nil {
 		panic(err)
 	}
-	if _, err = peerConnection.AddTrack(videoTrack); err != nil {
+	rtpSender, err := peerConnection.AddTrack(videoTrack)
+	if err != nil {
 		panic(err)
 	}
+
+	// Read incoming RTCP packets
+	// Before these packets are retuned they are processed by interceptors. For things
+	// like NACK this needs to be called.
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 
 	iceConnectedCtx, iceConnectedCtxCancel := context.WithCancel(context.Background())
 	go func() {
@@ -100,7 +87,7 @@ func main() {
 			}
 
 			time.Sleep(sleepTime)
-			if ivfErr = videoTrack.WriteSample(media.Sample{Data: frame, Samples: 90000}); ivfErr != nil {
+			if ivfErr = videoTrack.WriteSample(media.Sample{Data: frame, Duration: time.Second}); ivfErr != nil {
 				panic(ivfErr)
 			}
 		}
@@ -114,6 +101,10 @@ func main() {
 			iceConnectedCtxCancel()
 		}
 	})
+
+	// Wait for the offer to be pasted
+	offer := webrtc.SessionDescription{}
+	signal.Decode(signal.MustReadStdin(), &offer)
 
 	// Set the remote SessionDescription
 	if err = peerConnection.SetRemoteDescription(offer); err != nil {
