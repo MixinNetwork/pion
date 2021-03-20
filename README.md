@@ -264,6 +264,8 @@ Check out the **[contributing wiki](https://github.com/pion/webrtc/wiki/Contribu
 * [Mats](https://github.com/Mindgamesnl)
 * [donotanswer](https://github.com/f-viktor)
 * [Reese](https://github.com/figadore)
+* [David Zhao](https://github.com/davidzhao)
+* [Nam V. Do](https://github.com/namvdo)
 
 ### License
 MIT License - see [LICENSE](LICENSE) for full text
