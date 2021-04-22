@@ -18,6 +18,7 @@ import (
 	"github.com/pion/dtls/v2"
 	"github.com/pion/dtls/v2/pkg/crypto/fingerprint"
 	"github.com/pion/logging"
+	"github.com/pion/rtcp"
 	"github.com/pion/srtp/v2"
 	"github.com/pion/webrtc/v3/internal/mux"
 	"github.com/pion/webrtc/v3/internal/util"
@@ -119,6 +120,30 @@ func (t *DTLSTransport) State() DTLSTransportState {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	return t.state
+}
+
+// WriteRTCP sends a user provided RTCP packet to the connected peer. If no peer is connected the
+// packet is discarded.
+func (t *DTLSTransport) WriteRTCP(pkts []rtcp.Packet) (int, error) {
+	raw, err := rtcp.Marshal(pkts)
+	if err != nil {
+		return 0, err
+	}
+
+	srtcpSession, err := t.getSRTCPSession()
+	if err != nil {
+		return 0, nil
+	}
+
+	writeStream, err := srtcpSession.OpenWriteStream()
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", errPeerConnWriteRTCPOpenWriteStream, err)
+	}
+
+	if n, err := writeStream.Write(raw); err != nil {
+		return n, err
+	}
+	return 0, nil
 }
 
 // GetLocalParameters returns the DTLS parameters of the local DTLSTransport upon construction.
@@ -262,8 +287,8 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 			return DTLSRole(0), nil, &rtcerr.InvalidStateError{Err: fmt.Errorf("%w: %s", errInvalidDTLSStart, t.state)}
 		}
 
-		t.srtpEndpoint = t.iceTransport.NewEndpoint(mux.MatchSRTP)
-		t.srtcpEndpoint = t.iceTransport.NewEndpoint(mux.MatchSRTCP)
+		t.srtpEndpoint = t.iceTransport.newEndpoint(mux.MatchSRTP)
+		t.srtcpEndpoint = t.iceTransport.newEndpoint(mux.MatchSRTCP)
 		t.remoteParameters = remoteParameters
 
 		cert := t.certificates[0]
@@ -284,7 +309,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 	}
 
 	var dtlsConn *dtls.Conn
-	dtlsEndpoint := t.iceTransport.NewEndpoint(mux.MatchDTLS)
+	dtlsEndpoint := t.iceTransport.newEndpoint(mux.MatchDTLS)
 	role, dtlsConfig, err := prepareTransport()
 	if err != nil {
 		return err
